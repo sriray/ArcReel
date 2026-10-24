@@ -8,6 +8,7 @@ import { DetailPane } from "@/components/shared/master-detail/DetailPane";
 import { TruncatedText } from "@/components/shared/TruncatedText";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAppStore } from "@/stores/app-store";
@@ -20,7 +21,7 @@ import { cn } from "cn";
 
 import { FilePreview } from "./FilePreview";
 import { TrashSection } from "./TrashSection";
-import { ownerTarget } from "./file-view-model";
+import { canDeleteFile, ownerTarget } from "./file-view-model";
 
 type DirectoryState =
   | { status: "loading" }
@@ -33,12 +34,14 @@ type DirectoryState =
  */
 function useDirectories(projectName: string, refreshKey: number) {
   const [directories, setDirectories] = useState<Record<string, DirectoryState>>({});
-  const controllerRef = useRef<AbortController | null>(null);
+  const controllersRef = useRef(new Map<string, AbortController>());
 
   useEffect(() => {
-    const controller = new AbortController();
-    controllerRef.current = controller;
-    return () => controller.abort();
+    const controllers = controllersRef.current;
+    return () => {
+      for (const controller of controllers.values()) controller.abort();
+      controllers.clear();
+    };
   }, []);
 
   const loadedRef = useRef(new Set<string>());
@@ -46,7 +49,10 @@ function useDirectories(projectName: string, refreshKey: number) {
   const load = useCallback(
     (path: string) => {
       loadedRef.current.add(path);
-      const signal = controllerRef.current?.signal;
+      controllersRef.current.get(path)?.abort();
+      const controller = new AbortController();
+      controllersRef.current.set(path, controller);
+      const { signal } = controller;
       API.getFileView(projectName, path, { signal })
         .then((listing) => {
           if (signal?.aborted) return;
@@ -76,6 +82,11 @@ function useDirectories(projectName: string, refreshKey: number) {
   );
 
   return { directories, load, retry };
+}
+
+function findEntry(directories: Record<string, DirectoryState>, path: string): FileViewEntry | null {
+  const directory = directories[path.slice(0, Math.max(path.lastIndexOf("/"), 0))];
+  return directory?.status === "ready" ? (directory.entries.find((entry) => entry.path === path) ?? null) : null;
 }
 
 type FileViewSection = "files" | "trash";
@@ -125,7 +136,11 @@ function FilesSection({ projectName, refreshKey }: { projectName: string; refres
   const { t } = useTranslation("dashboard");
   const { directories, load, retry } = useDirectories(projectName, refreshKey);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
-  const [selected, setSelected] = useState<FileViewEntry | null>(null);
+  // 只记路径，条目取自最新的目录列表：刷新后详情跟着更新，文件不在了详情也随之消失。
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const selected = selectedPath === null ? null : findEntry(directories, selectedPath);
+  const [checked, setChecked] = useState<ReadonlyMap<string, FileViewEntry>>(new Map());
+  const [deleting, setDeleting] = useState(false);
 
   const toggle = (path: string) => {
     const next = new Set(expanded);
@@ -138,9 +153,49 @@ function FilesSection({ projectName, refreshKey }: { projectName: string; refres
     setExpanded(next);
   };
 
-  const onDeleted = () => {
-    setSelected(null);
-    useAppStore.getState().invalidateTrash();
+  const toggleChecked = (entry: FileViewEntry) => {
+    setChecked((current) => {
+      const next = new Map(current);
+      if (next.has(entry.path)) next.delete(entry.path);
+      else next.set(entry.path, entry);
+      return next;
+    });
+  };
+
+  // 每个文件单独提交、单独恢复；失败项保留勾选，方便重试。
+  const moveToTrash = async (entries: FileViewEntry[]) => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      await Promise.all(entries.map(async (entry) => {
+        try {
+          const { record } = await API.deleteFileViewEntry(projectName, entry.path);
+          setSelectedPath((current) => (current === entry.path ? null : current));
+          setChecked((current) => {
+            const next = new Map(current);
+            next.delete(entry.path);
+            return next;
+          });
+          useAppStore.getState().pushToast(t("file_view_moved_to_trash", { name: entry.name }), "info", {
+            action: {
+              label: t("trash_restore"),
+              onClick: () => {
+                API.restoreTrashRecord(projectName, record.id)
+                  .catch((error: unknown) => {
+                    useAppStore.getState().pushToast(t("trash_action_failed", { message: errMsg(error) }), "error");
+                  })
+                  .finally(() => useAppStore.getState().invalidateTrash());
+              },
+            },
+          });
+        } catch (error) {
+          useAppStore.getState().pushToast(t("file_view_delete_failed", { name: entry.name, message: errMsg(error) }), "error");
+        }
+      }));
+    } finally {
+      setDeleting(false);
+      useAppStore.getState().invalidateTrash();
+    }
   };
 
   return (
@@ -149,18 +204,32 @@ function FilesSection({ projectName, refreshKey }: { projectName: string; refres
         aria-label={t("file_view_tree_label")}
         className="relative flex w-[clamp(240px,32cqw,360px)] shrink-0 flex-col overflow-y-auto border-r px-2 py-3 [scrollbar-gutter:stable]"
       >
+        {checked.size > 0 ? (
+          <div className="flex flex-wrap items-center gap-2 px-2 pb-3">
+            <Button variant="outline" size="sm" disabled={deleting} onClick={() => void moveToTrash([...checked.values()])}>
+              {deleting ? <Loader2 data-icon="inline-start" aria-hidden className="animate-spin" /> : <Trash2 data-icon="inline-start" aria-hidden />}
+              {t("file_view_delete_selected", { total: checked.size })}
+            </Button>
+            <Button variant="ghost" size="sm" disabled={deleting} onClick={() => setChecked(new Map())}>
+              {t("file_view_clear_selection")}
+            </Button>
+          </div>
+        ) : null}
         <DirectoryList
           path=""
           directories={directories}
           expanded={expanded}
-          selectedPath={selected?.path ?? null}
+          selectedPath={selectedPath}
           onToggle={toggle}
-          onSelect={setSelected}
+          onSelect={(entry) => setSelectedPath(entry.path)}
           onRetry={retry}
+          checked={checked}
+          deleting={deleting}
+          onCheck={toggleChecked}
         />
       </nav>
       {selected ? (
-        <FileDetail key={selected.path} projectName={projectName} entry={selected} onDeleted={onDeleted} />
+        <FileDetail key={selected.path} projectName={projectName} entry={selected} deleting={deleting} onDelete={() => void moveToTrash([selected])} />
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
           <Empty>
@@ -185,11 +254,14 @@ interface DirectoryListProps {
   onToggle: (path: string) => void;
   onSelect: (entry: FileViewEntry) => void;
   onRetry: (path: string) => void;
+  checked: ReadonlyMap<string, FileViewEntry>;
+  deleting: boolean;
+  onCheck: (entry: FileViewEntry) => void;
 }
 
 function DirectoryList(props: DirectoryListProps) {
   const { t } = useTranslation("dashboard");
-  const { path, directories, expanded, selectedPath, onToggle, onSelect, onRetry } = props;
+  const { path, directories, expanded, selectedPath, onToggle, onSelect, onRetry, checked, deleting, onCheck } = props;
   const state = directories[path];
   if (!state || state.status === "loading") {
     return <p className="px-2 py-1 text-xs text-muted-foreground">{t("file_view_loading")}</p>;
@@ -237,14 +309,23 @@ function DirectoryList(props: DirectoryListProps) {
         }
         const active = entry.path === selectedPath;
         return (
-          <li key={entry.path}>
+          <li key={entry.path} className="flex min-w-0 items-center gap-1">
+            {canDeleteFile(entry) ? (
+              <Checkbox
+                aria-label={t("file_view_select_file", { name: entry.name })}
+                checked={checked.has(entry.path)}
+                disabled={deleting}
+                onCheckedChange={() => onCheck(entry)}
+                className="ml-2"
+              />
+            ) : null}
             <button
               type="button"
               aria-pressed={active}
               onClick={() => onSelect(entry)}
               className={cn(
                 rowClass,
-                "pl-7",
+                canDeleteFile(entry) ? "flex-1" : "pl-7",
                 active ? "bg-primary/15 text-foreground" : "text-subtle-foreground hover:bg-muted/60 hover:text-foreground",
               )}
             >
@@ -268,19 +349,20 @@ function DirectoryList(props: DirectoryListProps) {
 function FileDetail({
   projectName,
   entry,
-  onDeleted,
+  deleting,
+  onDelete,
 }: {
   projectName: string;
   entry: FileViewEntry;
-  onDeleted: () => void;
+  deleting: boolean;
+  onDelete: () => void;
 }) {
   const { t } = useTranslation("dashboard");
   const [downloading, setDownloading] = useState(false);
-  const [deleting, setDeleting] = useState(false);
   const target = ownerTarget(entry.owner, projectName);
   const unreferencedSource = entry.role === "unreferenced" && entry.owner?.kind === "source";
   // 只有未引用文件能在这里删除；服务端同样校验，这里只决定是否给出按钮。
-  const deletable = entry.role === "unreferenced" && !unreferencedSource;
+  const deletable = canDeleteFile(entry);
   const description = entry.role
     ? t(unreferencedSource ? "file_view_role_desc_unreferenced_source" : `file_view_role_desc_${entry.role}`)
     : null;
@@ -294,31 +376,6 @@ function FileDetail({
       useAppStore.getState().pushToast(t("file_view_download_failed", { name: entry.name, message: errMsg(error) }), "error");
     } finally {
       setDownloading(false);
-    }
-  };
-
-  // 移入项目回收站可以恢复，不弹确认，提示里直接给「恢复」。
-  const moveToTrash = async () => {
-    setDeleting(true);
-    try {
-      const { record } = await API.deleteFileViewEntry(projectName, entry.path);
-      onDeleted();
-      useAppStore.getState().pushToast(t("file_view_moved_to_trash", { name: entry.name }), "info", {
-        action: {
-          label: t("trash_restore"),
-          onClick: () => {
-            API.restoreTrashRecord(projectName, record.id)
-              .catch((error: unknown) => {
-                useAppStore.getState().pushToast(t("trash_action_failed", { message: errMsg(error) }), "error");
-              })
-              .finally(() => useAppStore.getState().invalidateTrash());
-          },
-        },
-      });
-    } catch (error) {
-      useAppStore.getState().pushToast(t("file_view_delete_failed", { name: entry.name, message: errMsg(error) }), "error");
-    } finally {
-      setDeleting(false);
     }
   };
 
@@ -358,7 +415,7 @@ function FileDetail({
           {t("file_view_download")}
         </Button>
         {deletable ? (
-          <Button variant="outline" size="sm" disabled={deleting} onClick={() => void moveToTrash()}>
+          <Button variant="outline" size="sm" disabled={deleting} onClick={onDelete}>
             {deleting ? (
               <Loader2 data-icon="inline-start" aria-hidden className="animate-spin" />
             ) : (
@@ -375,7 +432,8 @@ function FileDetail({
     <DetailPane header={header}>
       <div className="flex flex-col gap-4 px-6 py-4">
         {description ? <p className="text-sm text-subtle-foreground">{description}</p> : null}
-        <FilePreview projectName={projectName} entry={entry} />
+        {/* 同一路径的文件被改写后（修改时间或大小变化）重新挂载：等待新内容时显示加载中，不沿用旧预览 */}
+        <FilePreview key={`${entry.modified_at}:${entry.size}`} projectName={projectName} entry={entry} />
       </div>
     </DetailPane>
   );

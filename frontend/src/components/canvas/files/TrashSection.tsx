@@ -45,7 +45,8 @@ export function TrashSection({ projectName, refreshKey }: { projectName: string;
   const { t } = useTranslation("dashboard");
   const trashRevision = useAppStore((s) => s.trashRevision);
   const [state, setState] = useState<ListingState>({ status: "loading" });
-  const [busyId, setBusyId] = useState<string | null>(null);
+  // 可以同时恢复多条记录：每条记录各自占用，完成时只释放自己。
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
   const [purge, setPurge] = useState<PurgeRequest | null>(null);
 
   const load = useCallback(
@@ -70,7 +71,7 @@ export function TrashSection({ projectName, refreshKey }: { projectName: string;
   const afterChange = () => useAppStore.getState().invalidateTrash();
 
   const restore = async (record: TrashRecord) => {
-    setBusyId(record.id);
+    setBusyIds((current) => new Set(current).add(record.id));
     try {
       const { restored } = await API.restoreTrashRecord(projectName, record.id);
       const asHistory = restored.some((item) => item.as_history);
@@ -84,7 +85,11 @@ export function TrashSection({ projectName, refreshKey }: { projectName: string;
     } catch (error) {
       useAppStore.getState().pushToast(t("trash_action_failed", { message: errMsg(error) }), "error");
     } finally {
-      setBusyId(null);
+      setBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(record.id);
+        return next;
+      });
       afterChange();
     }
   };
@@ -143,7 +148,7 @@ export function TrashSection({ projectName, refreshKey }: { projectName: string;
       ) : (
         <ul className="relative flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-2 [scrollbar-gutter:stable]">
           {records.map((record) => {
-            const busy = busyId === record.id;
+            const busy = busyIds.has(record.id);
             return (
               <li key={record.id} className="flex items-center gap-3 rounded-md px-2 py-2 hover:bg-muted/40">
                 <div className="flex min-w-0 flex-1 flex-col">
