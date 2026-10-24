@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.34.1](https://github.com/ArcReel/ArcReel/compare/v0.34.0...v0.34.1) (2026-10-24)
+
+
+### 🐛 Bug 修复
+
+* **frontend:** 按 React Doctor 全量诊断修正前端竞态、key、可访问性与模块边界 ([#3412](https://github.com/ArcReel/ArcReel/issues/3412)) ([4ababbe](https://github.com/ArcReel/ArcReel/commit/4ababbe120d4e4259132902a8ae097b026a0e715))
+
+
+### 📚 文档
+
+* **standards:** 整理中文文案规范，统一界面文案的标点写法 ([#3417](https://github.com/ArcReel/ArcReel/issues/3417)) ([a64ec21](https://github.com/ArcReel/ArcReel/commit/a64ec21969895bc6d5b1b0449de6003d21f95f77))
+
 ## [0.34.0](https://github.com/ArcReel/ArcReel/compare/v0.33.0...v0.34.0) (2026-10-24)
 
 
